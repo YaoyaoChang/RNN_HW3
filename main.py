@@ -6,6 +6,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.onnx
+import torch.optim as optim
 
 import data
 import model
@@ -45,10 +46,16 @@ parser.add_argument('--save', type=str, default='model.pt',
                     help='path to save the final model')
 parser.add_argument('--onnx-export', type=str, default='',
                     help='path to export the final model in onnx format')
-parser.add_argument('--device', type=int, default=0, 
-                    help='report interval')
+parser.add_argument('--device', type=int, default=0, help='gpu device index')
+parser.add_argument('--attention', action='store_true', help='use attention in lstm')
+parser.add_argument('--dropout_input', type=float, default=0.4, help=' ')
+parser.add_argument('--dropout_rnn', type=float, default=0.25, help=' ')
+parser.add_argument('--dropout_decoder', type=float, default=0.5, help=' ')
+parser.add_argument('--optim', default='sgd', const='sgd', nargs='?', choices=['sgd', 'adam', 'asgd'], help='Select which optimizer')
+parser.add_argument('--patience', type=int, default=1, metavar='P', help='patience for lr decrease ')
 args = parser.parse_args()
 
+print("start")
 # Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
 if torch.cuda.is_available():
@@ -83,7 +90,8 @@ def batchify(data, bsz):
     # Evenly divide the data across the bsz batches.
     data = data.view(bsz, -1).t().contiguous()
     return data.to(device)
-
+# print(corpus.train.size()) # 925989
+# print(corpus.valid.size()) # 73760
 eval_batch_size = 10
 train_data = batchify(corpus.train, args.batch_size)
 val_data = batchify(corpus.valid, eval_batch_size)
@@ -94,9 +102,23 @@ val_data = batchify(corpus.valid, eval_batch_size)
 ###############################################################################
 
 ntokens = len(corpus.dictionary)
-model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout, args.tied).to(device)
+# print("debug:ntokens=",ntokens) # 10000
+model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nlayers, args.dropout_input, args.dropout_rnn, args.dropout_decoder, args.tied, args.attention).to(device)
 
-criterion = nn.CrossEntropyLoss()
+if args.optim == 'sgd':
+    optimizer = optim.SGD(model.parameters(),
+                          lr=args.lr, weight_decay=12e-7)
+if args.optim == 'asgd':
+    optimizer = optim.ASGD(model.parameters(),
+                           lr=args.lr, weight_decay=12e-7)
+if args.optim == 'adam':
+    optimizer = optim.Adam(model.parameters(), lr=args.lr,
+                           betas=(0.0, 0.999), eps=1e-8,
+                           weight_decay=12e-7, amsgrad=True)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', patience=args.patience,
+        verbose=True, factor=0.2)
+criterion = nn.CrossEntropyLoss(ignore_index=0)
 
 ###############################################################################
 # Training code
@@ -162,18 +184,25 @@ def train():
 
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-        for p in model.parameters():
-            p.data.add_(-lr, p.grad.data)
+#         for p in model.parameters():
+#             p.data.add_(-lr, p.grad.data)
+        optimizer.step()
 
         total_loss += loss.item()
 
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
+            try:
+                print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
                     'loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch, batch, len(train_data) // args.bptt, lr,
+                epoch, batch, len(train_data) // args.bptt, optimizer.param_groups[0]['lr'],
                 elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
+            except OverflowError:
+                print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
+                    'loss {:5.2f} | ppl overflow'.format(
+                epoch, batch, len(train_data) // args.bptt, optimizer.param_groups[0]['lr'],
+                elapsed * 1000 / args.log_interval, cur_loss))
             total_loss = 0
             start_time = time.time()
 
@@ -197,19 +226,27 @@ try:
         epoch_start_time = time.time()
         train()
         val_loss = evaluate(val_data)
+#         val_loss *= epoch # This is only for testing the scheduler.
+        
+        scheduler.step(val_loss)
         print('-' * 89)
-        print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+        try:
+            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
                 'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
                                            val_loss, math.exp(val_loss)))
+        except OverflowError:
+            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                'valid ppl ppl'.format(epoch, (time.time() - epoch_start_time),
+                                           val_loss))
         print('-' * 89)
         # Save the model if the validation loss is the best we've seen so far.
         if not best_val_loss or val_loss < best_val_loss:
 #             with open(args.save, 'wb') as f:
 #                 torch.save(model, f)
             best_val_loss = val_loss
-        else:
-            # Anneal the learning rate if no improvement has been seen in the validation dataset.
-            lr /= 4.0
+#         else:
+#             # Anneal the learning rate if no improvement has been seen in the validation dataset.
+#             lr /= 4.0
 except KeyboardInterrupt:
     print('-' * 89)
     print('Exiting from training early')
